@@ -1,7 +1,7 @@
 ---
-# AWX playbook: create an isolated VM for a nested Proxmox VE / ProxMenux lab.
-# It creates the VM from an ISO and leaves it powered off for review. Install
-# Proxmox VE in its console, then install ProxMenux INSIDE that nested PVE host.
+# AWX playbook: create an ordinary, disposable Ubuntu test VM on your existing
+# Proxmox VE host. It leaves the new VM powered off for review; start it and
+# install Ubuntu using the VM console when you are ready.
 # No third-party Ansible collection is required; this uses ansible.builtin.uri.
 #
 # AWX setup:
@@ -29,22 +29,23 @@
 #   pve_api_host: 10.128.0.10       # Proxmox VE host IP or DNS name
 #   pve_node: pve                  # Exact node name shown by Proxmox
 #   vm_id: 310                     # Unused numeric VM ID
-#   vm_name: proxmenux-lab
+#   vm_name: awx-created-test
 #   vm_disk_storage: local-lvm     # Storage that permits VM disks
-#   vm_iso: local:iso/proxmox-ve_9.2-1.iso  # Exact volume ID of uploaded ISO
-# Optional: vm_bridge (vmbr0), vm_memory_mb (4096), vm_cores (2),
-#           vm_disk_gb (64), pve_validate_certs (true).
+#   vm_iso: local:iso/ubuntu-24.04.3-live-server-amd64.iso
+#           # Use the exact volume ID of the ISO you actually uploaded
+# Optional: vm_bridge (vmbr0), vm_memory_mb (2048), vm_cores (2),
+#           vm_disk_gb (25), pve_validate_certs (true).
 # The AWX execution environment must reach https://pve_api_host:8006.
 
-- name: Create a nested Proxmox VE lab VM
+- name: Create a disposable VM on Proxmox VE
   hosts: localhost
   connection: local
   gather_facts: false
   vars:
     vm_bridge: vmbr0
-    vm_memory_mb: 4096
+    vm_memory_mb: 2048
     vm_cores: 2
-    vm_disk_gb: 64
+    vm_disk_gb: 25
     pve_validate_certs: true
     pve_api: "https://{{ pve_api_host }}:8006/api2/json"
     pve_headers:
@@ -81,7 +82,7 @@
         fail_msg: "VM ID {{ vm_id }} exists with another name. Choose an unused ID."
       when: current_vm.status == 200
 
-    - name: Create the VM, attached Proxmox VE installer ISO, and SATA disk
+    - name: Create the VM, attached Ubuntu installer ISO, and disk
       ansible.builtin.uri:
         url: "{{ pve_api }}/nodes/{{ pve_node }}/qemu"
         method: POST
@@ -94,11 +95,11 @@
           sockets: 1
           cores: "{{ vm_cores }}"
           memory: "{{ vm_memory_mb }}"
-          cpu: host
-          sata0: "{{ vm_disk_storage }}:{{ vm_disk_gb }}"
+          scsihw: virtio-scsi-single
+          scsi0: "{{ vm_disk_storage }}:{{ vm_disk_gb }}"
           ide2: "{{ vm_iso }},media=cdrom"
           net0: "virtio,bridge={{ vm_bridge }}"
-          boot: "order=ide2;sata0"
+          boot: "order=ide2;scsi0"
         validate_certs: "{{ pve_validate_certs }}"
         status_code: 200
       register: create_vm
@@ -130,6 +131,6 @@
       ansible.builtin.debug:
         msg: >-
           VM {{ vm_id }} ({{ vm_name }}) is present on {{ pve_node }} and is left
-          powered off. Review its settings, start it, install Proxmox VE from
-          the attached ISO via the console, and then install ProxMenux on that
-          nested Proxmox host. Existing VMs are not reconfigured by this playbook.
+          powered off. Review its settings, start it, and install Ubuntu from
+          the attached ISO via the console. Existing VMs are not reconfigured
+          by this playbook.
