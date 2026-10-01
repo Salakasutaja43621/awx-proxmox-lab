@@ -1,0 +1,135 @@
+---
+# AWX playbook: create an isolated VM for a nested Proxmox VE / ProxMenux lab.
+# It creates the VM from an ISO and leaves it powered off for review. Install
+# Proxmox VE in its console, then install ProxMenux INSIDE that nested PVE host.
+# No third-party Ansible collection is required; this uses ansible.builtin.uri.
+#
+# AWX setup:
+#   1. Put this file in a Git repository and add that repository as an AWX Project.
+#   2. Create a custom Credential Type with Input Configuration:
+#        fields:
+#          - id: token_id
+#            type: string
+#            label: Proxmox API token ID
+#          - id: token_secret
+#            type: string
+#            label: Proxmox API token secret
+#            secret: true
+#        required: [token_id, token_secret]
+#      Injector Configuration:
+#        env:
+#          PVE_TOKEN_ID: '{{ token_id }}'
+#          PVE_TOKEN_SECRET: '{{ token_secret }}'
+#   3. Create a Credential of that type and attach it to an AWX Job Template.
+#      Select an inventory containing localhost and this playbook in the Project.
+#   4. Supply the required extra variables listed below through the Job Template
+#      or a Survey. Do not put token values in Git or survey extra variables.
+#
+# Required extra variables (example values only):
+#   pve_api_host: 10.128.0.10       # Proxmox VE host IP or DNS name
+#   pve_node: pve                  # Exact node name shown by Proxmox
+#   vm_id: 310                     # Unused numeric VM ID
+#   vm_name: proxmenux-lab
+#   vm_disk_storage: local-lvm     # Storage that permits VM disks
+#   vm_iso: local:iso/proxmox-ve_9.2-1.iso  # Exact volume ID of uploaded ISO
+# Optional: vm_bridge (vmbr0), vm_memory_mb (4096), vm_cores (2),
+#           vm_disk_gb (64), pve_validate_certs (true).
+# The AWX execution environment must reach https://pve_api_host:8006.
+
+- name: Create a nested Proxmox VE lab VM
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  vars:
+    vm_bridge: vmbr0
+    vm_memory_mb: 4096
+    vm_cores: 2
+    vm_disk_gb: 64
+    pve_validate_certs: true
+    pve_api: "https://{{ pve_api_host }}:8006/api2/json"
+    pve_headers:
+      Authorization: "PVEAPIToken={{ lookup('ansible.builtin.env', 'PVE_TOKEN_ID') }}={{ lookup('ansible.builtin.env', 'PVE_TOKEN_SECRET') }}"
+
+  tasks:
+    - name: Verify required configuration and credentials
+      ansible.builtin.assert:
+        that:
+          - pve_api_host is defined
+          - pve_node is defined
+          - vm_id is defined
+          - vm_name is defined
+          - vm_disk_storage is defined
+          - vm_iso is defined
+          - lookup('ansible.builtin.env', 'PVE_TOKEN_ID') | length > 0
+          - lookup('ansible.builtin.env', 'PVE_TOKEN_SECRET') | length > 0
+        fail_msg: "Set the required VM variables and attach the Proxmox API token credential."
+
+    - name: Look up the VM ID on the selected Proxmox node
+      ansible.builtin.uri:
+        url: "{{ pve_api }}/nodes/{{ pve_node }}/qemu/{{ vm_id }}/config"
+        method: GET
+        headers: "{{ pve_headers }}"
+        validate_certs: "{{ pve_validate_certs }}"
+        status_code: [200, 404]
+      register: current_vm
+      no_log: true
+
+    - name: Refuse to overwrite a different VM using the same ID
+      ansible.builtin.assert:
+        that:
+          - current_vm.json.data.name == vm_name
+        fail_msg: "VM ID {{ vm_id }} exists with another name. Choose an unused ID."
+      when: current_vm.status == 200
+
+    - name: Create the VM, attached Proxmox VE installer ISO, and SATA disk
+      ansible.builtin.uri:
+        url: "{{ pve_api }}/nodes/{{ pve_node }}/qemu"
+        method: POST
+        headers: "{{ pve_headers }}"
+        body_format: form-urlencoded
+        body:
+          vmid: "{{ vm_id }}"
+          name: "{{ vm_name }}"
+          ostype: l26
+          sockets: 1
+          cores: "{{ vm_cores }}"
+          memory: "{{ vm_memory_mb }}"
+          cpu: host
+          sata0: "{{ vm_disk_storage }}:{{ vm_disk_gb }}"
+          ide2: "{{ vm_iso }},media=cdrom"
+          net0: "virtio,bridge={{ vm_bridge }}"
+          boot: "order=ide2;sata0"
+        validate_certs: "{{ pve_validate_certs }}"
+        status_code: 200
+      register: create_vm
+      when: current_vm.status == 404
+      no_log: true
+
+    - name: Wait for the Proxmox VM creation task to finish
+      ansible.builtin.uri:
+        url: "{{ pve_api }}/nodes/{{ pve_node }}/tasks/{{ create_vm.json.data | urlencode }}/status"
+        method: GET
+        headers: "{{ pve_headers }}"
+        validate_certs: "{{ pve_validate_certs }}"
+        status_code: 200
+      register: create_status
+      until: create_status.json.data.status == 'stopped'
+      retries: 60
+      delay: 5
+      when: current_vm.status == 404
+      no_log: true
+
+    - name: Confirm that Proxmox created the VM successfully
+      ansible.builtin.assert:
+        that:
+          - create_status.json.data.exitstatus == 'OK'
+        fail_msg: "Proxmox reported that the VM creation task failed; inspect Tasks on node {{ pve_node }}."
+      when: current_vm.status == 404
+
+    - name: Show the next manual steps
+      ansible.builtin.debug:
+        msg: >-
+          VM {{ vm_id }} ({{ vm_name }}) is present on {{ pve_node }} and is left
+          powered off. Review its settings, start it, install Proxmox VE from
+          the attached ISO via the console, and then install ProxMenux on that
+          nested Proxmox host. Existing VMs are not reconfigured by this playbook.
