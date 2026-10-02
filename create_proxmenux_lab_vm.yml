@@ -73,7 +73,6 @@
         validate_certs: "{{ pve_validate_certs }}"
         status_code: [200, 404]
       register: current_vm
-      no_log: true
 
     - name: Refuse to overwrite a different VM using the same ID
       ansible.builtin.assert:
@@ -104,7 +103,6 @@
         status_code: 200
       register: create_vm
       when: current_vm.status == 404
-      no_log: true
 
     - name: Wait for the Proxmox VM creation task to finish
       ansible.builtin.uri:
@@ -118,7 +116,6 @@
       retries: 60
       delay: 5
       when: current_vm.status == 404
-      no_log: true
 
     - name: Confirm that Proxmox created the VM successfully
       ansible.builtin.assert:
