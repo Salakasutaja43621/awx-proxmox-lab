@@ -57,7 +57,6 @@
         that:
           - pve_api_host is defined
           - pve_node is defined
-          - vm_id is defined
           - vm_name is defined
           - vm_disk_storage is defined
           - vm_iso is defined
@@ -65,21 +64,53 @@
           - lookup('ansible.builtin.env', 'PVE_TOKEN_SECRET') | length > 0
         fail_msg: "Set the required VM variables and attach the Proxmox API token credential."
 
-    - name: Look up the VM ID on the selected Proxmox node
+    - name: List existing VMs on the selected node
       ansible.builtin.uri:
-        url: "{{ pve_api }}/nodes/{{ pve_node }}/qemu/{{ vm_id }}/config"
+        url: "{{ pve_api }}/nodes/{{ pve_node }}/qemu"
         method: GET
         headers: "{{ pve_headers }}"
         validate_certs: "{{ pve_validate_certs }}"
-        status_code: [200, 404]
-      register: current_vm
+        status_code: 200
+      register: vm_list
 
-    - name: Refuse to overwrite a different VM using the same ID
+    - name: Find an existing VM with the requested name
+      ansible.builtin.set_fact:
+        matching_vms: >-
+          {{
+            vm_list.json.data
+            | selectattr('name', 'defined')
+            | selectattr('name', 'equalto', vm_name)
+            | list
+          }}
+
+    - name: Refuse ambiguous VM names
       ansible.builtin.assert:
         that:
-          - current_vm.json.data.name == vm_name
-        fail_msg: "VM ID {{ vm_id }} exists with another name. Choose an unused ID."
-      when: current_vm.status == 200
+          - matching_vms | length <= 1
+        fail_msg: "Multiple VMs named {{ vm_name }} exist on {{ pve_node }}."
+
+    - name: Determine whether creation is needed
+      ansible.builtin.set_fact:
+        needs_creation: "{{ matching_vms | length == 0 }}"
+
+    - name: Get the next available VM ID
+      ansible.builtin.uri:
+        url: "{{ pve_api }}/cluster/nextid"
+        method: GET
+        headers: "{{ pve_headers }}"
+        validate_certs: "{{ pve_validate_certs }}"
+        status_code: 200
+      register: next_id
+      when: needs_creation | bool
+
+    - name: Set the VM ID for subsequent tasks
+      ansible.builtin.set_fact:
+        selected_vm_id: >-
+          {{
+            (next_id.json.data | int)
+            if (needs_creation | bool)
+            else (matching_vms[0].vmid | int)
+          }}
 
     - name: Create the VM, attached Ubuntu installer ISO, and disk
       ansible.builtin.uri:
@@ -88,7 +119,7 @@
         headers: "{{ pve_headers }}"
         body_format: form-urlencoded
         body:
-          vmid: "{{ vm_id }}"
+          vmid: "{{ selected_vm_id }}"
           name: "{{ vm_name }}"
           ostype: l26
           sockets: 1
@@ -102,7 +133,8 @@
         validate_certs: "{{ pve_validate_certs }}"
         status_code: 200
       register: create_vm
-      when: current_vm.status == 404
+      changed_when: true
+      when: needs_creation | bool
 
     - name: Wait for the Proxmox VM creation task to finish
       ansible.builtin.uri:
@@ -115,19 +147,21 @@
       until: create_status.json.data.status == 'stopped'
       retries: 60
       delay: 5
-      when: current_vm.status == 404
+      when: needs_creation | bool
 
     - name: Confirm that Proxmox created the VM successfully
       ansible.builtin.assert:
         that:
           - create_status.json.data.exitstatus == 'OK'
         fail_msg: "Proxmox reported that the VM creation task failed; inspect Tasks on node {{ pve_node }}."
-      when: current_vm.status == 404
+      when: needs_creation | bool
 
-    - name: Show the next manual steps
+    - name: Show the result
       ansible.builtin.debug:
         msg: >-
-          VM {{ vm_id }} ({{ vm_name }}) is present on {{ pve_node }} and is left
-          powered off. Review its settings, start it, and install Ubuntu from
-          the attached ISO via the console. Existing VMs are not reconfigured
-          by this playbook.
+          VM {{ selected_vm_id }} ({{ vm_name }}) on {{ pve_node }}
+          {{ 'was created and left powered off'
+             if (needs_creation | bool)
+             else 'already exists and was left unchanged' }}.
+          For a newly created VM, review its settings, start it,
+          and install Ubuntu from the attached ISO via the console.
