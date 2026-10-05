@@ -158,7 +158,6 @@
       when: needs_creation | bool
 
 
-    - name: Show the result
     - name: Finish unattended installation for the newly created VM
       when: needs_creation | bool
       block:
