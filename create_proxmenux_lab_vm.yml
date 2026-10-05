@@ -119,6 +119,7 @@
         headers: "{{ pve_headers }}"
         body_format: form-urlencoded
         body:
+          start: 1
           vmid: "{{ selected_vm_id }}"
           name: "{{ vm_name }}"
           ostype: l26
@@ -156,12 +157,69 @@
         fail_msg: "Proxmox reported that the VM creation task failed; inspect Tasks on node {{ pve_node }}."
       when: needs_creation | bool
 
+
     - name: Show the result
-      ansible.builtin.debug:
-        msg: >-
-          VM {{ selected_vm_id }} ({{ vm_name }}) on {{ pve_node }}
-          {{ 'was created and left powered off'
-             if (needs_creation | bool)
-             else 'already exists and was left unchanged' }}.
-          For a newly created VM, review its settings, start it,
-          and install Ubuntu from the attached ISO via the console.
+    - name: Finish unattended installation for the newly created VM
+      when: needs_creation | bool
+      block:
+        - name: Wait for the Debian installer to power off the VM
+          ansible.builtin.uri:
+            url: "{{ pve_api }}/nodes/{{ pve_node }}/qemu/{{ selected_vm_id }}/status/current"
+            method: GET
+            headers: "{{ pve_headers }}"
+            validate_certs: "{{ pve_validate_certs }}"
+            status_code: 200
+          register: installer_state
+          until: installer_state.json.data.status == 'stopped'
+          retries: 360
+          delay: 10
+          changed_when: false
+
+        - name: Detach the installer ISO and boot only from the disk
+          ansible.builtin.uri:
+            url: "{{ pve_api }}/nodes/{{ pve_node }}/qemu/{{ selected_vm_id }}/config"
+            method: PUT
+            headers: "{{ pve_headers }}"
+            body_format: form-urlencoded
+            body:
+              ide2: "none,media=cdrom"
+              boot: "order=scsi0"
+            validate_certs: "{{ pve_validate_certs }}"
+            status_code: 200
+          changed_when: true
+
+        - name: Start the installed Debian VM
+          ansible.builtin.uri:
+            url: "{{ pve_api }}/nodes/{{ pve_node }}/qemu/{{ selected_vm_id }}/status/start"
+            method: POST
+            headers: "{{ pve_headers }}"
+            validate_certs: "{{ pve_validate_certs }}"
+            status_code: 200
+          register: debian_start
+          changed_when: true
+
+        - name: Wait for the Debian startup task
+          ansible.builtin.uri:
+            url: "{{ pve_api }}/nodes/{{ pve_node }}/tasks/{{ debian_start.json.data | urlencode }}/status"
+            method: GET
+            headers: "{{ pve_headers }}"
+            validate_certs: "{{ pve_validate_certs }}"
+            status_code: 200
+          register: debian_start_status
+          until: debian_start_status.json.data.status == 'stopped'
+          retries: 60
+          delay: 2
+          changed_when: false
+
+        - name: Confirm that Proxmox started the VM
+          ansible.builtin.assert:
+            that:
+              - debian_start_status.json.data.exitstatus == 'OK'
+            fail_msg: "Proxmox could not start the installed VM; check its task log."
+
+        - name: Show the provisioning result
+          ansible.builtin.debug:
+            msg: >-
+              VM {{ selected_vm_id }} ({{ vm_name }}) has been started
+              from its disk. The installer ISO is detached.
+              Guest access and installation validation are the next checks.
